@@ -1,6 +1,7 @@
 import hpack
 import hyperframe.frame
 import pytest
+from tests import concurrency
 
 import httpcore
 
@@ -380,3 +381,31 @@ def test_http2_remote_max_streams_update():
                         conn._h2_state.local_settings.max_concurrent_streams,
                     )
                 i += 1
+
+
+
+def test_http2_concurrent_send_request_headers() -> None:
+    origin = httpcore.Origin(b"https", b"example.com", 443)
+    stream = httpcore.MockStream([])
+    conn = httpcore.HTTP2Connection(origin=origin, stream=stream)
+    conn._sent_connection_init = True
+
+    def send_headers(worker_id: int) -> None:
+        request = httpcore.Request(
+            method=b"GET",
+            url=f"https://example.com/item/{worker_id}",
+            headers=[
+                (b"host", b"example.com"),
+                (b"user-agent", b"httpcore-test"),
+            ]
+            + [
+                (f"x-custom-{k}".encode(), f"val-{k}-{worker_id}".encode())
+                for k in range(15)
+            ],
+        )
+        stream_id = conn._send_request_headers(request=request)
+        assert stream_id > 0
+
+    with concurrency.open_nursery() as nursery:
+        for i in range(10):
+            nursery.start_soon(send_headers, i)

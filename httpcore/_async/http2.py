@@ -19,7 +19,12 @@ from .._exceptions import (
     RemoteProtocolError,
 )
 from .._models import Origin, Request, Response
-from .._synchronization import AsyncLock, AsyncSemaphore, AsyncShieldCancellation
+from .._synchronization import (
+    AsyncLock,
+    AsyncSemaphore,
+    AsyncShieldCancellation,
+    AsyncThreadLock,
+)
 from .._trace import Trace
 from .interfaces import AsyncConnectionInterface
 
@@ -60,6 +65,11 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
         self._state_lock = AsyncLock()
         self._read_lock = AsyncLock()
         self._write_lock = AsyncLock()
+        # Lock guarding in-memory h2 state transitions in multi-threaded sync mode.
+        # In async mode, AsyncThreadLock is a zero-cost no-op because asyncio is
+        # single-threaded; all operations inside this lock are strictly synchronous
+        # (no `await` expressions) and released before any blocking network I/O.
+        self._h2_thread_lock = AsyncThreadLock()
         self._sent_connection_init = False
         self._used_all_stream_ids = False
         self._connection_error = False
@@ -130,18 +140,13 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
 
         await self._max_streams_semaphore.acquire()
 
+        stream_id: int | None = None
         try:
-            stream_id = self._h2_state.get_next_available_stream_id()
-            self._events[stream_id] = []
-        except h2.exceptions.NoAvailableStreamIDError:  # pragma: nocover
-            self._used_all_stream_ids = True
-            self._request_count -= 1
-            raise ConnectionNotAvailable()
-
-        try:
-            kwargs = {"request": request, "stream_id": stream_id}
+            kwargs: dict[str, typing.Any] = {"request": request}
             async with Trace("send_request_headers", logger, request, kwargs):
-                await self._send_request_headers(request=request, stream_id=stream_id)
+                stream_id = await self._send_request_headers(request=request)
+            kwargs["stream_id"] = stream_id
+
             async with Trace("send_request_body", logger, request, kwargs):
                 await self._send_request_body(request=request, stream_id=stream_id)
             async with Trace(
@@ -163,10 +168,13 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
                 },
             )
         except BaseException as exc:  # noqa: PIE786
-            with AsyncShieldCancellation():
-                kwargs = {"stream_id": stream_id}
-                async with Trace("response_closed", logger, request, kwargs):
-                    await self._response_closed(stream_id=stream_id)
+            if stream_id is not None:
+                with AsyncShieldCancellation():
+                    response_closed_kwargs = {"stream_id": stream_id}
+                    async with Trace(
+                        "response_closed", logger, request, response_closed_kwargs
+                    ):
+                        await self._response_closed(stream_id=stream_id)
 
             if isinstance(exc, h2.exceptions.ProtocolError):
                 # One case where h2 can raise a protocol error is when a
@@ -219,7 +227,7 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
 
     # Sending the request...
 
-    async def _send_request_headers(self, request: Request, stream_id: int) -> None:
+    async def _send_request_headers(self, request: Request) -> int:
         """
         Send the request headers to a given stream ID.
         """
@@ -246,9 +254,20 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
             )
         ]
 
-        self._h2_state.send_headers(stream_id, headers, end_stream=end_stream)
-        self._h2_state.increment_flow_control_window(2**24, stream_id=stream_id)
+        with self._h2_thread_lock:
+            try:
+                stream_id = self._h2_state.get_next_available_stream_id()
+                self._events[stream_id] = []
+            except h2.exceptions.NoAvailableStreamIDError:  # pragma: nocover
+                self._used_all_stream_ids = True
+                self._request_count -= 1
+                raise ConnectionNotAvailable()
+
+            self._h2_state.send_headers(stream_id, headers, end_stream=end_stream)
+            self._h2_state.increment_flow_control_window(2**24, stream_id=stream_id)
+
         await self._write_outgoing_data(request)
+        return stream_id
 
     async def _send_request_body(self, request: Request, stream_id: int) -> None:
         """
@@ -272,14 +291,16 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
             max_flow = await self._wait_for_outgoing_flow(request, stream_id)
             chunk_size = min(len(data), max_flow)
             chunk, data = data[:chunk_size], data[chunk_size:]
-            self._h2_state.send_data(stream_id, chunk)
+            with self._h2_thread_lock:
+                self._h2_state.send_data(stream_id, chunk)
             await self._write_outgoing_data(request)
 
     async def _send_end_stream(self, request: Request, stream_id: int) -> None:
         """
         Send an empty data frame on on a given stream ID with the END_STREAM flag set.
         """
-        self._h2_state.end_stream(stream_id)
+        with self._h2_thread_lock:
+            self._h2_state.end_stream(stream_id)
         await self._write_outgoing_data(request)
 
     # Receiving the response...
@@ -318,7 +339,8 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
                 assert event.flow_controlled_length is not None
                 assert event.data is not None
                 amount = event.flow_controlled_length
-                self._h2_state.acknowledge_received_data(amount, stream_id)
+                with self._h2_thread_lock:
+                    self._h2_state.acknowledge_received_data(amount, stream_id)
                 await self._write_outgoing_data(request)
                 yield event.data
             elif isinstance(event, h2.events.StreamEnded):
@@ -422,9 +444,8 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
                     await self.aclose()
 
     async def aclose(self) -> None:
-        # Note that this method unilaterally closes the connection, and does
-        # not have any kind of locking in place around it.
-        self._h2_state.close_connection()
+        with self._h2_thread_lock:
+            self._h2_state.close_connection()
         self._state = HTTPConnectionState.CLOSED
         await self._network_stream.aclose()
 
@@ -454,7 +475,8 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
             self._connection_error = True
             raise exc
 
-        events: list[h2.events.Event] = self._h2_state.receive_data(data)
+        with self._h2_thread_lock:
+            events: list[h2.events.Event] = self._h2_state.receive_data(data)
 
         return events
 
@@ -463,7 +485,8 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
         timeout = timeouts.get("write", None)
 
         async with self._write_lock:
-            data_to_send = self._h2_state.data_to_send()
+            with self._h2_thread_lock:
+                data_to_send = self._h2_state.data_to_send()
 
             if self._write_exception is not None:
                 raise self._write_exception  # pragma: nocover
@@ -493,13 +516,15 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
         WindowUpdated frames have increased the flow rate.
         https://tools.ietf.org/html/rfc7540#section-6.9
         """
-        local_flow: int = self._h2_state.local_flow_control_window(stream_id)
-        max_frame_size: int = self._h2_state.max_outbound_frame_size
+        with self._h2_thread_lock:
+            local_flow: int = self._h2_state.local_flow_control_window(stream_id)
+            max_frame_size: int = self._h2_state.max_outbound_frame_size
         flow = min(local_flow, max_frame_size)
         while flow == 0:
             await self._receive_events(request)
-            local_flow = self._h2_state.local_flow_control_window(stream_id)
-            max_frame_size = self._h2_state.max_outbound_frame_size
+            with self._h2_thread_lock:
+                local_flow = self._h2_state.local_flow_control_window(stream_id)
+                max_frame_size = self._h2_state.max_outbound_frame_size
             flow = min(local_flow, max_frame_size)
         return flow
 
